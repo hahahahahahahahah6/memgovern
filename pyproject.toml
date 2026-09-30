@@ -13,7 +13,7 @@ authors = [{name = "hao li"}]
 keywords = ["ai-agents", "memory", "governance", "tombstone", "decay"]
 
 [project.urls]
-Homepage = "https://github.com/hahahahahahahah6/memory-governance"
+Homepage = "https://github.com/hahahahahahahah6/memgovern"
 
 [tool.setuptools.packages.find]
 include = ["memgovern*"]

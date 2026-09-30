@@ -1,10 +1,16 @@
 # memgovern
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+[![No dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](pyproject.toml)
+
 A tiny memory governance layer for AI agents. Everyone is building the **store and search**
 side of agent memory. memgovern does the neglected half: **write and delete** — when a memory
 should fade, when it should die, and who wins when two memories disagree.
 
 Zero dependencies. SQLite under the hood. `pip install` and go.
+
+![demo](demo.svg)
 
 ```python
 from memgovern import MemoryStore, ConflictPolicy

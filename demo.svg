@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="1464" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13.5">
+<rect width="100%" height="100%" rx="10" fill="#0d1117"/>
+<circle cx="28" cy="20" r="6" fill="#ff5f57"/><circle cx="50" cy="20" r="6" fill="#febc2e"/><circle cx="72" cy="20" r="6" fill="#28c840"/>
+<text x="100" y="25" fill="#8b949e" font-size="12">hao@dev: ~/memgovern — python demo.py</text>
+<text x="18" y="66"></text>
+<text x="18" y="86"><tspan fill="#7dd3fc">================================================================</tspan></text>
+<text x="18" y="106"><tspan fill="#7dd3fc" font-weight="bold">  ACT 1 — FORGETTING: low-importance memories decay away</tspan></text>
+<text x="18" y="126"><tspan fill="#7dd3fc">================================================================</tspan></text>
+<text x="18" y="146"></text>
+<text x="18" y="166"><tspan fill="#fbbf24">-&gt; right after writing:</tspan></text>
+<text x="18" y="186"><tspan fill="#a7f3d0">    [deploy.region] status=alive score=0.950</tspan></text>
+<text x="18" y="206"><tspan fill="#d1d5db">      &quot;Production deploys to us-west-2&quot;</tspan></text>
+<text x="18" y="226"><tspan fill="#a7f3d0">    [wifi.guest] status=alive score=0.300</tspan></text>
+<text x="18" y="246"><tspan fill="#d1d5db">      &quot;Guest wifi password is &#x27;coffee123&#x27;&quot;</tspan></text>
+<text x="18" y="266"><tspan fill="#6b7280">   ...      300s pass ...</tspan></text>
+<text x="18" y="286"></text>
+<text x="18" y="306"><tspan fill="#fbbf24">-&gt; 5 minutes later (low-importance trivia has decayed below the forget threshold):</tspan></text>
+<text x="18" y="326"><tspan fill="#a7f3d0">    [deploy.region] status=alive score=0.950</tspan></text>
+<text x="18" y="346"><tspan fill="#d1d5db">      &quot;Production deploys to us-west-2&quot;</tspan></text>
+<text x="18" y="366"><tspan fill="#a7f3d0">   wifi.guest (recalled with include_forgotten=True) [wifi.guest] status=alive score=0.009</tspan></text>
+<text x="18" y="386"><tspan fill="#d1d5db">      &quot;Guest wifi password is &#x27;coffee123&#x27;&quot;</tspan></text>
+<text x="18" y="406"><tspan fill="#d1d5db">   The row still exists in SQLite - forgetting is a filter, not erasure.</tspan></text>
+<text x="18" y="426"></text>
+<text x="18" y="446"><tspan fill="#7dd3fc">================================================================</tspan></text>
+<text x="18" y="466"><tspan fill="#7dd3fc" font-weight="bold">  ACT 2 — TOMBSTONES: deletes are recorded, not erased</tspan></text>
+<text x="18" y="486"><tspan fill="#7dd3fc">================================================================</tspan></text>
+<text x="18" y="506"></text>
+<text x="18" y="526"><tspan fill="#fbbf24">-&gt; before delete:</tspan></text>
+<text x="18" y="546"><tspan fill="#a7f3d0">    [user.theme] status=alive score=0.800</tspan></text>
+<text x="18" y="566"><tspan fill="#d1d5db">      &quot;User prefers dark mode&quot;</tspan></text>
+<text x="18" y="586"></text>
+<text x="18" y="606"><tspan fill="#fbbf24">-&gt; delete() tombstoned 1 row(s)</tspan></text>
+<text x="18" y="626"><tspan fill="#fbbf24">-&gt; after delete:</tspan></text>
+<text x="18" y="646"><tspan fill="#d1d5db">    -&gt; None (gone)</tspan></text>
+<text x="18" y="666"><tspan fill="#fbbf24">-&gt; but the audit trail remembers:</tspan></text>
+<text x="18" y="686"><tspan fill="#d1d5db">   #2 tombstone  actor=agent details={&#x27;reason&#x27;: &#x27;user switched to light mode on 2026-09-29&#x27;, &#x27;version&#x27;: 1}</tspan></text>
+<text x="18" y="706"><tspan fill="#d1d5db">   #1 write      actor=agent details={&#x27;version&#x27;: 1, &#x27;status&#x27;: &#x27;alive&#x27;, &#x27;importance&#x27;: 0.8, &#x27;ttl&#x27;: None, &#x27;pola</tspan></text>
+<text x="18" y="726"><tspan fill="#d1d5db">     rity&#x27;: &#x27;fact&#x27;}</tspan></text>
+<text x="18" y="746"><tspan fill="#fbbf24">-&gt; and the row is still in the DB:</tspan></text>
+<text x="18" y="766"><tspan fill="#d1d5db">   stats: {&#x27;tombstoned&#x27;: 1}</tspan></text>
+<text x="18" y="786"></text>
+<text x="18" y="806"><tspan fill="#7dd3fc">================================================================</tspan></text>
+<text x="18" y="826"><tspan fill="#7dd3fc" font-weight="bold">  ACT 3 — CONFLICT ARBITRATION: contradictory writes get judged</tspan></text>
+<text x="18" y="846"><tspan fill="#7dd3fc">================================================================</tspan></text>
+<text x="18" y="866"></text>
+<text x="18" y="886"><tspan fill="#fbbf24">-&gt; agent learns a new (contradictory) fact:</tspan></text>
+<text x="18" y="906"><tspan fill="#a7f3d0">   new write [office.wifi] status=pending score=0.700</tspan></text>
+<text x="18" y="926"><tspan fill="#d1d5db">      &quot;Office wifi password is &#x27;xyz789&#x27;&quot;</tspan></text>
+<text x="18" y="946"></text>
+<text x="18" y="966"><tspan fill="#fbbf24">-&gt; 1 conflict(s) pending; the new write is quarantined:</tspan></text>
+<text x="18" y="986"><tspan fill="#fca5a5">   conflict #1 policy=manual resolution=None</tspan></text>
+<text x="18" y="1006"><tspan fill="#fbbf24">-&gt; read() still returns the old, trusted fact until a human arbitrates:</tspan></text>
+<text x="18" y="1026"><tspan fill="#a7f3d0">    [office.wifi] status=alive score=0.700</tspan></text>
+<text x="18" y="1046"><tspan fill="#d1d5db">      &quot;Office wifi password is &#x27;abc123&#x27;&quot;</tspan></text>
+<text x="18" y="1066"></text>
+<text x="18" y="1086"><tspan fill="#fbbf24">-&gt; human arbitrates: the new password wins</tspan></text>
+<text x="18" y="1106"><tspan fill="#fca5a5">   conflict #1 resolved: manual-new-wins</tspan></text>
+<text x="18" y="1126"><tspan fill="#a7f3d0">   after arbitration [office.wifi] status=alive score=0.700</tspan></text>
+<text x="18" y="1146"><tspan fill="#d1d5db">      &quot;Office wifi password is &#x27;xyz789&#x27;&quot;</tspan></text>
+<text x="18" y="1166"></text>
+<text x="18" y="1186"><tspan fill="#fbbf24">-&gt; full audit trail for office.wifi:</tspan></text>
+<text x="18" y="1206"><tspan fill="#fca5a5">   #4 conflict_resolved mem=2 details={&#x27;conflict_id&#x27;: 1, &#x27;resolution&#x27;: &#x27;manual-new-wins&#x27;, &#x27;winner_id&#x27;: 2, &#x27;l</tspan></text>
+<text x="18" y="1226"><tspan fill="#d1d5db">     oser_id&#x27;: 1}</tspan></text>
+<text x="18" y="1246"><tspan fill="#d1d5db">   #3 write            mem=2 details={&#x27;version&#x27;: 2, &#x27;status&#x27;: &#x27;pending&#x27;, &#x27;importance&#x27;: 0.7, &#x27;ttl&#x27;: None, &#x27;po</tspan></text>
+<text x="18" y="1266"><tspan fill="#d1d5db">     larity&#x27;: &#x27;fact&#x27;}</tspan></text>
+<text x="18" y="1286"><tspan fill="#fca5a5">   #2 conflict_flagged mem=None details={&#x27;conflict_id&#x27;: 1, &#x27;policy&#x27;: &#x27;manual&#x27;, &#x27;note&#x27;: &#x27;new write quarantine</tspan></text>
+<text x="18" y="1306"><tspan fill="#d1d5db">     d as PENDING; call resolve_conflict()&#x27;}</tspan></text>
+<text x="18" y="1326"><tspan fill="#d1d5db">   #1 write            mem=1 details={&#x27;version&#x27;: 1, &#x27;status&#x27;: &#x27;alive&#x27;, &#x27;importance&#x27;: 0.7, &#x27;ttl&#x27;: None, &#x27;pola</tspan></text>
+<text x="18" y="1346"><tspan fill="#d1d5db">     rity&#x27;: &#x27;fact&#x27;}</tspan></text>
+<text x="18" y="1366"></text>
+<text x="18" y="1386"><tspan fill="#7dd3fc">================================================================</tspan></text>
+<text x="18" y="1406"><tspan fill="#d1d5db">  DONE — memgovern: memories that know how to die, and why</tspan></text>
+<text x="18" y="1426"><tspan fill="#7dd3fc">================================================================</tspan></text>
+</svg>

@@ -122,6 +122,29 @@ history of any memory — the "why" behind the current state.
 **Negative knowledge.** `polarity="lesson"` marks failure-experiences ("don't do X"),
 the most valuable and least systematically stored kind of memory.
 
+**Write reservations (compare-and-swap).** Two sessions, one key: session A reads
+`user/plan`, session B rewrites it, session A writes based on what it read an hour
+ago — last-writer-wins silently destroys B's work. The fix is optimistic
+concurrency:
+
+```python
+token = store.reserve("user/plan", source="session-a")   # bound to the key's version
+# ... think, draft, deliberate ...
+mem = store.write("user/plan", new_text, source="session-a", reservation=token)
+if mem.status == "conflict":
+    current = mem.conflict_current   # the live value that won the race
+    # merge and retry with a fresh reservation
+```
+
+`reserve()` binds the token to the key's current live version (0 when the key is
+absent, so create-if-absent is guarded too). `write(reservation=token)` applies
+only if the token is valid, unexpired, and the version is unchanged; otherwise it
+returns status `"conflict"` — never persisted, the attempted write is NOT applied —
+with the current value attached. Tokens expire after 5 minutes by default
+(`ttl_seconds`), are consumed on a successful write, and `release_reservation()`
+releases early. The MCP server exposes `memory_reserve` and accepts `reservation`
+on `memory_write`. Reservation issue / CAS apply / CAS conflict are all audit-logged.
+
 ## Design notes
 
 - **Deterministic core.** Same-key conflicts, exponential decay, tombstones — all
@@ -129,11 +152,12 @@ the most valuable and least systematically stored kind of memory.
   constructor argument, not a prompt.
 - **Clock injection.** `MemoryStore(clock=...)` accepts any epoch-seconds callable, so
   decay and expiry are trivially testable (see `demo.py`'s `FakeClock`).
-- **Schema.** Five tables: `memories` (status ∈ alive/pending/superseded/tombstoned),
+- **Schema.** Six tables: `memories` (status ∈ alive/pending/superseded/tombstoned),
   `conflicts`, `audit`, `source_stats` (per-source reliability ledger),
-  `write_log` (recent writes for burst detection, pruned on every write).
-  SQLite via the standard library — the whole DB is one file you can inspect
-  with any SQLite client. Old v0.1 databases migrate on open (`IF NOT EXISTS`).
+  `write_log` (recent writes for burst detection, pruned on every write),
+  `reservations` (CAS tokens, lazily expired). SQLite via the standard library —
+  the whole DB is one file you can inspect with any SQLite client. Old v0.1
+  databases migrate on open (`IF NOT EXISTS`).
 
 ## How it differs
 
@@ -184,8 +208,8 @@ new arbitration logic.
   semantic arbitration (LLM-judged) is out of scope for v0.1.
 - **Naive ranking.** `query()` ranks by decay score plus token overlap — fine for
   hundreds of memories, not a replacement for vector search at scale.
-- **Single node.** One SQLite file, one process. No replication, no multi-agent
-  locking (a natural v0.2: hook into the session-bus / reservation pattern).
+- **Single node.** One SQLite file, one process. No replication. Cross-session
+  lost updates are handled by advisory write reservations (v0.4), not locks.
 - **Poisoning defense is structural, not semantic.** v0.2 adds source-trust scoring
   and tripwires, but a patient attacker can *farm* trust: write benign memories for a
   while, win a few fair arbitrations, then poison. The scores are heuristics, not proof
@@ -195,13 +219,21 @@ new arbitration logic.
 - **Trust is per-source, not per-agent.** A source label is only as honest as whatever
   sets it. If the attacker controls the `source` string on their writes, the ledger
   measures the attacker's patience, not their reliability.
+- **Reservations are advisory, not locks.** They are enforced only through this API —
+  a process writing the SQLite file directly bypasses them. Expiry is wall-clock,
+  so a sleeping VM can surprise you. This is optimistic concurrency for cooperating
+  sessions, not a distributed lock.
 
 ## Roadmap ideas
 
 - LLM-judged contradiction detection as an optional arbitrator
 - ~~Source trust scores (per-`source` reliability that weights conflict outcomes)~~ — shipped in v0.2
 - ~~MCP server wrapper so Claude Code / Cursor can use it as a tool~~ — shipped in v0.3
-- Multi-session write reservations (compare-and-swap on keys)
+- ~~Multi-session write reservations (compare-and-swap on keys)~~ — shipped in v0.4
+
+Roadmap exhausted for now. The remaining item (LLM-judged arbitration) needs an LLM,
+which would break the zero-dependency contract — it stays an idea until that tradeoff
+is worth it.
 
 ## License
 

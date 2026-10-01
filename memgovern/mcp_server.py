@@ -68,6 +68,10 @@ TOOLS = [
             "contradictions are quarantined for review (manual policy), "
             "prompt-injection tripwires quarantine suspicious writes, and "
             "arbitration='trust' auto-arbitrates by source trust. "
+            "Pass a reservation token from memory_reserve for "
+            "compare-and-swap: the write applies only if the key is unchanged "
+            "since the reservation, otherwise it returns status 'conflict' "
+            "with the current value. "
             "SQLite backend. Structural defense, no LLM, no network."
         ),
         "inputSchema": {
@@ -82,8 +86,35 @@ TOOLS = [
                                 "description": "manual (default): quarantine contradictions; "
                                                "trust: auto-arbitrate when the source-trust gap "
                                                "exceeds the threshold"},
+                "reservation": {"type": "string",
+                                "description": "optional CAS token from memory_reserve; "
+                                               "lost races return status 'conflict' and are NOT applied"},
             },
             "required": ["key", "text"],
+        },
+    },
+    {
+        "name": "memory_reserve",
+        "description": (
+            "Reserve a key for a compare-and-swap write. Returns an opaque "
+            "token bound to the key's current version (0 when absent). Pass "
+            "it to memory_write as reservation: the write applies only if no "
+            "other session changed the key meanwhile. Prevents last-writer-"
+            "wins across concurrent agent sessions. Advisory: only enforced "
+            "through this API, not against raw SQLite writes."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "memory key to reserve"},
+                "source": {"type": "string",
+                           "description": "who is reserving (audit label)",
+                           "default": "agent"},
+                "ttl_seconds": {"type": "number",
+                                "description": "reservation expiry in seconds",
+                                "default": 300},
+            },
+            "required": ["key"],
         },
     },
     {
@@ -220,13 +251,37 @@ def _tool_memory_write(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, An
         kwargs["ttl"] = float(args["ttl_seconds"])
     if args.get("arbitration") is not None:
         kwargs["arbitration"] = args["arbitration"]
+    if args.get("reservation") is not None:
+        kwargs["reservation"] = args["reservation"]
     mem = store.write(key, text, **kwargs)
     out = _memory_json(mem)
     out["conflict_id"] = mem.conflict_id
     out["source_trust"] = round(store.source_trust(mem.source), 4)
     if mem.status == MemoryStatus.PENDING:
         out["quarantine_reason"] = _quarantine_reason(store, mem)
+    if mem.status == MemoryStatus.CONFLICT:
+        # CAS lost race: nothing was applied. Attach the current live value
+        # so the caller can merge and retry with a fresh reservation.
+        out["note"] = ("CAS conflict: the key changed since the reservation; "
+                       "write NOT applied")
+        out["current"] = (_memory_json(mem.conflict_current)
+                          if mem.conflict_current else None)
     return _ok_text(out)
+
+
+def _tool_memory_reserve(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, Any]:
+    key = args["key"]
+    if not isinstance(key, str):
+        raise ValueError("key must be a string")
+    ttl = args.get("ttl_seconds", 300)
+    token = store.reserve(key, source=args.get("source", "agent"),
+                          ttl_seconds=float(ttl))
+    current = store.read(key)
+    return _ok_text({
+        "token": token,
+        "key": key,
+        "current": _memory_json(current) if current else None,
+    })
 
 
 def _tool_memory_read(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -324,6 +379,7 @@ def _reject_tripwire_quarantine(store: MemoryStore, mem: Memory, reviewer: str) 
 
 _TOOL_HANDLERS = {
     "memory_write": _tool_memory_write,
+    "memory_reserve": _tool_memory_reserve,
     "memory_read": _tool_memory_read,
     "memory_delete": _tool_memory_delete,
     "memory_trust_report": _tool_memory_trust_report,

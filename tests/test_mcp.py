@@ -74,11 +74,11 @@ class MCPHarness(unittest.TestCase):
         self.assertIsNone(mcp_server.handle_request(
             {"jsonrpc": "2.0", "method": "notifications/initialized"}))
 
-    def test_tools_list_has_six_tools(self):
+    def test_tools_list_has_seven_tools(self):
         resp = self._req("tools/list")
         names = {t["name"] for t in resp["result"]["tools"]}
         self.assertEqual(names, {
-            "memory_write", "memory_read", "memory_delete",
+            "memory_write", "memory_reserve", "memory_read", "memory_delete",
             "memory_trust_report", "memory_pending_conflicts", "memory_release",
         })
         for t in resp["result"]["tools"]:

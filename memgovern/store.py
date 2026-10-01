@@ -1,6 +1,7 @@
 """MemoryStore: the governance layer. SQLite, zero dependencies."""
 
 import json
+import secrets
 import sqlite3
 import time
 from typing import Callable, List, Optional
@@ -82,6 +83,19 @@ CREATE TABLE IF NOT EXISTS write_log (
     ts     REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_write_log_source_ts ON write_log(source, ts);
+
+-- v0.4: optimistic-concurrency reservations (compare-and-swap).
+-- expected_version is the key's live version at reserve time; 0 means the
+-- key was absent. IF NOT EXISTS migrates old DBs on open.
+CREATE TABLE IF NOT EXISTS reservations (
+    token            TEXT PRIMARY KEY,
+    key              TEXT NOT NULL,
+    source           TEXT NOT NULL DEFAULT 'agent',
+    expected_version INTEGER NOT NULL,
+    created_at       REAL NOT NULL,
+    expires_at       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reservations_key ON reservations(key);
 """
 
 
@@ -203,6 +217,7 @@ class MemoryStore:
         polarity: str = "fact",
         also_check_similar: bool = False,
         arbitration: Optional[str] = None,
+        reservation: Optional[str] = None,
     ) -> Memory:
         """Store a memory. Same-key contradictions trigger the conflict policy.
 
@@ -213,10 +228,26 @@ class MemoryStore:
         trust_threshold, and quarantines otherwise. Poisoning tripwires
         always quarantine, in either mode -- a tripwire hit is never
         auto-accepted.
+
+        reservation: a token from reserve(). The write applies only if the
+        token is valid, unexpired, and the key's live version is unchanged
+        since the reservation (compare-and-swap). A lost race returns a
+        Memory with status "conflict" (never persisted) carrying the current
+        live value as conflict_current; the attempted write is NOT applied.
+        Without a reservation, writes behave exactly as before.
         """
         if arbitration not in (None, "manual", "trust"):
             raise ValueError("arbitration must be 'manual' or 'trust'")
         now = self._now()
+
+        # CAS gate, first: a stale token fails before anything is counted.
+        # The token is consumed (released) only on success.
+        cas_expected = None
+        if reservation is not None:
+            ok, cas_expected, reason = self._cas_check(key, reservation, now)
+            if not ok:
+                return self._cas_conflict_memory(key, text, source, now, reason)
+
         importance = self._clamp_importance(importance)
         expires_at = now + ttl if ttl else None
 
@@ -300,6 +331,15 @@ class MemoryStore:
             "version": version, "status": status, "importance": importance,
             "ttl": ttl, "polarity": polarity,
         })
+
+        if reservation is not None:
+            # CAS succeeded: consume the token so it can't be replayed.
+            self._db.execute("DELETE FROM reservations WHERE token=?", (reservation,))
+            self._db.commit()
+            self._audit("cas_applied", key, mem_id, {
+                "token_prefix": reservation[:8],
+                "expected_version": cas_expected, "applied_version": version,
+            })
 
         if also_check_similar:
             for other, sim in self._find_similar(key, text, exclude_id=mem_id):
@@ -512,6 +552,109 @@ class MemoryStore:
         self._audit("quarantine_released", mem.key, memory_id,
                     {"note": "tripwire quarantine reviewed and released"})
         return self._get(memory_id)
+
+    # ------------------------------------------------- reservations (CAS)
+
+    def _prune_reservations(self, now: float):
+        """Lazily drop expired reservations. No audit: expiry is routine."""
+        self._db.execute("DELETE FROM reservations WHERE expires_at <= ?", (now,))
+        self._db.commit()
+
+    def _key_version(self, key: str, now: float) -> int:
+        """The version a fresh read() would see for `key`: highest version
+        among live, non-expired rows. 0 when the key is effectively absent."""
+        row = self._db.execute(
+            """SELECT MAX(version) v FROM memories
+               WHERE key=? AND status=? AND (expires_at IS NULL OR expires_at > ?)""",
+            (key, MemoryStatus.ALIVE, now),
+        ).fetchone()
+        return row["v"] if row["v"] is not None else 0
+
+    def reserve(self, key: str, source: str = "agent", ttl_seconds: float = 300) -> str:
+        """Reserve `key` for a compare-and-swap write.
+
+        Returns an opaque token bound to the key's current live version
+        (0 when the key is absent, so create-if-absent is guarded too).
+        Pass it to write(reservation=token): the write applies only if the
+        key's version is unchanged since the reservation. Reservations expire
+        after ttl_seconds (default 5 minutes); expiry is wall-clock.
+        """
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+        now = self._now()
+        self._prune_reservations(now)
+        token = secrets.token_urlsafe(24)
+        expected = self._key_version(key, now)
+        self._db.execute(
+            """INSERT INTO reservations
+               (token, key, source, expected_version, created_at, expires_at)
+               VALUES (?,?,?,?,?,?)""",
+            (token, key, source, expected, now, now + ttl_seconds),
+        )
+        self._db.commit()
+        self._audit("reservation_issued", key, None, {
+            "token_prefix": token[:8], "source": source,
+            "expected_version": expected, "ttl_seconds": ttl_seconds,
+        })
+        return token
+
+    def release_reservation(self, token: str) -> bool:
+        """Release a reservation early. Unknown or already-released tokens are
+        a silent no-op (fail-soft); returns True when a token was released."""
+        now = self._now()
+        self._prune_reservations(now)
+        cur = self._db.execute("DELETE FROM reservations WHERE token=?", (token,))
+        self._db.commit()
+        if cur.rowcount:
+            self._audit("reservation_released", None, None,
+                        {"token_prefix": token[:8]})
+            return True
+        return False
+
+    def _cas_check(self, key: str, token: str, now: float):
+        """Validate a CAS reservation.
+
+        Returns (ok, expected_version, failure_reason). Consumes nothing;
+        the caller releases the token on success.
+        """
+        row = self._db.execute(
+            "SELECT * FROM reservations WHERE token=?", (token,)).fetchone()
+        if row is None:
+            return False, None, "unknown-or-released-token"
+        if row["expires_at"] <= now:
+            self._db.execute("DELETE FROM reservations WHERE token=?", (token,))
+            self._db.commit()
+            return False, None, "reservation-expired"
+        if row["key"] != key:
+            return False, None, "token-bound-to-another-key"
+        current = self._key_version(key, now)
+        if current != row["expected_version"]:
+            return False, row["expected_version"], "key-changed-since-reservation"
+        return True, row["expected_version"], None
+
+    def _cas_conflict_memory(self, key: str, text: str, source: str, now: float,
+                             reason: str) -> Memory:
+        """Build the unsaved CONFLICT result for a lost CAS race.
+
+        Nothing is written to the DB. The live value the caller must re-read
+        and merge against is attached as conflict_current (None if absent).
+        """
+        current = self.read(key)
+        mem = Memory(
+            id=-1, key=key, text=text, status=MemoryStatus.CONFLICT,
+            created_at=now, updated_at=now, expires_at=None, source=source,
+            importance=0.5, half_life=None, tags=[], polarity="fact",
+            conflict_id=None, deleted_reason=None,
+            version=self._key_version(key, now),
+            conflict_current=current,
+        )
+        self._audit("cas_conflict", key, None, {
+            "reason": reason, "attempted_source": source,
+            "current_id": current.id if current else None,
+            "current_version": mem.version,
+            "note": "write NOT applied; re-read the key and retry with a fresh reservation",
+        })
+        return mem
 
     def _apply_conflict_policy(self, key: str, rivals: List[Memory], now: float,
                                tripwire_reason: Optional[str] = None,

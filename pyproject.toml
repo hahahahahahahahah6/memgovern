@@ -4,13 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memgovern"
-version = "0.2.0"
+version = "0.3.0"
 description = "Memory governance for AI agents: decay, tombstones, conflict arbitration, audit"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [{name = "hao li"}]
 keywords = ["ai-agents", "memory", "governance", "tombstone", "decay"]
+
+[project.scripts]
+memgovern-mcp = "memgovern.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/hahahahahahahahah6/memgovern"

@@ -71,6 +71,47 @@ Contradiction detection is deterministic (same key, different text). An opt-in
 `also_check_similar=True` flag adds token-overlap hints across keys — logged to audit
 only, never auto-arbitrated, because heuristics shouldn't judge.
 
+**Source trust.** Every write records its `source`, and each source carries a
+reliability ledger: writes, conflicts won/lost, tombstones, quarantines. Trust is a
+Bayesian-smoothed win rate — `(wins + k·prior) / (decided + k)` with `prior = 0.5`,
+`k = 4` — so a new source starts exactly neutral and only *decided* arbitrations move
+the needle, never raw write volume. Idle scores decay toward the prior with a 30-day
+half-life, so a compromised-then-clean source can recover and a long-quiet "trusted"
+source quietly loses its halo.
+
+Pass `arbitration="trust"` to `write()` under the `manual` policy and a same-key
+contradiction is auto-arbitrated when the trust gap between the two sources exceeds
+`trust_threshold` (default 0.25): the higher-trust source wins, the loser is superseded
+(never silently deleted), and both scores land in the audit log. Close scores fall back
+to quarantine + `resolve_conflict()` as before. `store.source_trust("agent")` and
+`store.trust_report()` expose the ledger; `resolve_conflict()` credits the winner's
+source with a win.
+
+**Poisoning tripwires.** Three fixed, documented rules run on every write — structural,
+no LLM, no network. A hit never auto-accepts: the write is born `pending` (quarantined)
+and the reason is audit-logged.
+
+| Tripwire | Fires when |
+|---|---|
+| `new-source-vs-high-trust` | a source with zero recorded writes contradicts a key held by a source with trust ≥ 0.75 |
+| `burst` | one source writes more than 20 times in 60 s (all configurable) |
+| `injection-marker:<phrase>` | the text contains a known injection phrase — `ignore previous instructions`, `disregard previous instructions`, `system:`, `override your instructions`, `do anything now`, `developer mode`, `jailbreak` |
+
+The marker list is deliberately conservative: it catches the exact phrases attackers
+reuse and will miss paraphrases. Quarantined writes are reviewable via
+`pending_conflicts()` / the audit log and releasable with `release_quarantine()` —
+a tripwire hit is a pause for review, not a deletion.
+
+## Why trust scoring exists
+
+> "I tried to poison an AI agent's memory. It worked 216 out of 216 times." — Hacker News
+
+Memory-implantation attacks succeed ~98% of the time in published tests because nothing
+in the write path asks *who* is writing. memgovern can't read minds — poisoning defense
+here is structural, not semantic — but it can keep score: sources that repeatedly win
+fair arbitrations earn weight, and first-sight overwrites by strangers get quarantined
+instead of applied.
+
 **Expiry.** `ttl=` sets a hard deadline. Expired memories are filtered from reads;
 `stats()` reports how many are sitting expired.
 
@@ -88,9 +129,11 @@ the most valuable and least systematically stored kind of memory.
   constructor argument, not a prompt.
 - **Clock injection.** `MemoryStore(clock=...)` accepts any epoch-seconds callable, so
   decay and expiry are trivially testable (see `demo.py`'s `FakeClock`).
-- **Schema.** Three tables: `memories` (status ∈ alive/pending/superseded/tombstoned),
-  `conflicts`, `audit`. SQLite via the standard library — the whole DB is one file you
-  can inspect with any SQLite client.
+- **Schema.** Five tables: `memories` (status ∈ alive/pending/superseded/tombstoned),
+  `conflicts`, `audit`, `source_stats` (per-source reliability ledger),
+  `write_log` (recent writes for burst detection, pruned on every write).
+  SQLite via the standard library — the whole DB is one file you can inspect
+  with any SQLite client. Old v0.1 databases migrate on open (`IF NOT EXISTS`).
 
 ## How it differs
 
@@ -116,14 +159,20 @@ how to die, and can prove why.
   hundreds of memories, not a replacement for vector search at scale.
 - **Single node.** One SQLite file, one process. No replication, no multi-agent
   locking (a natural v0.2: hook into the session-bus / reservation pattern).
-- **Poisoning defense is structural, not semantic.** Tombstones and audit trails make
-  bad writes *visible and reversible*; they don't stop a cleverly-worded injection
-  from being written in the first place. Source-trust scoring is future work.
+- **Poisoning defense is structural, not semantic.** v0.2 adds source-trust scoring
+  and tripwires, but a patient attacker can *farm* trust: write benign memories for a
+  while, win a few fair arbitrations, then poison. The scores are heuristics, not proof
+  of good intent — they raise the cost of poisoning, they don't eliminate it. Tombstones
+  and audit trails still make bad writes visible and reversible; the marker list catches
+  known injection phrases and will miss paraphrases.
+- **Trust is per-source, not per-agent.** A source label is only as honest as whatever
+  sets it. If the attacker controls the `source` string on their writes, the ledger
+  measures the attacker's patience, not their reliability.
 
 ## Roadmap ideas
 
 - LLM-judged contradiction detection as an optional arbitrator
-- Source trust scores (per-`source` reliability that weights conflict outcomes)
+- ~~Source trust scores (per-`source` reliability that weights conflict outcomes)~~ — shipped in v0.2
 - MCP server wrapper so Claude Code / Cursor can use it as a tool
 - Multi-session write reservations (compare-and-swap on keys)
 

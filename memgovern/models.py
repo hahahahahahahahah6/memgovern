@@ -9,6 +9,7 @@ class MemoryStatus:
     PENDING = "pending"       # written but quarantined until a conflict is resolved
     SUPERSEDED = "superseded" # replaced by a newer version under the same key
     TOMBSTONED = "tombstoned" # deleted on purpose; kept for audit, never returned
+    CONFLICT = "conflict"     # CAS write that lost the race; never persisted
 
 
 class ConflictPolicy:
@@ -35,6 +36,8 @@ class Memory:
     deleted_reason: Optional[str] = None
     version: int = 1
     score: Optional[float] = None  # filled in by read()/query(): current decayed score
+    conflict_current: Optional["Memory"] = None  # set on a CAS-conflict write: the live
+        # memory that won the race (None if the key is absent)
 
     def expired(self, now: float) -> bool:
         return self.expires_at is not None and now >= self.expires_at

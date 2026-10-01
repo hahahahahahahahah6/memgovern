@@ -150,6 +150,33 @@ trying to be this):
 The bet: retrieval is a solved-enough problem; the missing piece is a memory that knows
 how to die, and can prove why.
 
+## MCP server
+
+`memgovern-mcp` exposes the governed memory as six MCP tools over stdio, so
+Claude Code / Cursor agents can use it directly. Every call goes through
+`MemoryStore` unchanged — tripwires, conflict policy and trust arbitration
+apply exactly as the library defines them. The server is a thin wrapper; all
+governance semantics live in the library.
+
+```bash
+pip install memgovern
+memgovern-mcp --print-config   # paste the JSON into your MCP client settings
+```
+
+Tools: `memory_write` (key, text, source, optional ttl_seconds and
+arbitration), `memory_read`, `memory_delete` (tombstone), `memory_trust_report`,
+`memory_pending_conflicts`, `memory_release` (accept/reject a quarantined write).
+
+The server defaults to the MANUAL conflict policy: a contradicting write is
+quarantined as PENDING for review instead of silently overwriting. Default DB
+is `~/.local/share/memgovern/memory.db` (`MEMGOVERN_DB` overrides); the DB is
+opened per tool call so other processes can share the file.
+
+Honest limits: stdio only (no SSE/HTTP). Your MCP client spawns the server as
+a subprocess, so the client and any direct library use must point at the same
+DB file. `memory_release` reviews quarantines the library created — it adds no
+new arbitration logic.
+
 ## Limitations (read before adopting)
 
 - **No semantic contradiction detection.** Conflicts are caught on identical keys;
@@ -173,7 +200,7 @@ how to die, and can prove why.
 
 - LLM-judged contradiction detection as an optional arbitrator
 - ~~Source trust scores (per-`source` reliability that weights conflict outcomes)~~ — shipped in v0.2
-- MCP server wrapper so Claude Code / Cursor can use it as a tool
+- ~~MCP server wrapper so Claude Code / Cursor can use it as a tool~~ — shipped in v0.3
 - Multi-session write reservations (compare-and-swap on keys)
 
 ## License

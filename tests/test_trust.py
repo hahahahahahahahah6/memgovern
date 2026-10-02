@@ -6,7 +6,9 @@ Run: python3 tests/test_trust.py  (or: python3 -m unittest discover -s tests)
 """
 
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -43,6 +45,25 @@ def give_wins(store, winner, loser, n):
         store.resolve_conflict(c.id, winner="new")
 
 
+def overwrite_store_with_trust(*trusted_sources):
+    """Temp-file store with OVERWRITE policy and the named sources pre-loaded
+    with 8 conflict wins each (trust ~0.83, above the high-trust floor).
+
+    Trust is earned through the real API under MANUAL policy first (the
+    store's policy is fixed at construction), then the DB is reopened with
+    OVERWRITE. Returns (store, tmpdir); the caller must close the store and
+    remove the tmpdir."""
+    tmpd = tempfile.mkdtemp(prefix="memgovern-tripwire-")
+    db = os.path.join(tmpd, "t.db")
+    clock = Clock()
+    s = MemoryStore(db, clock=clock, conflict_policy=ConflictPolicy.MANUAL)
+    for src in trusted_sources:
+        give_wins(s, src, "sloppy", 8)
+    s.close()
+    store = MemoryStore(db, clock=clock, conflict_policy=ConflictPolicy.OVERWRITE)
+    return store, tmpd
+
+
 class TestTrustMath(unittest.TestCase):
     def test_new_source_is_neutral(self):
         store, _ = fresh_store()
@@ -76,8 +97,14 @@ class TestTrustArbitration(unittest.TestCase):
     def test_auto_win_old_on_large_gap(self):
         store, _ = fresh_store()
         give_wins(store, "good", "sloppy", 8)  # good -> 10/12 ~= 0.833
-        store.write("deploy.region", "Production deploys to us-west-2", source="good")
-        store.write("setup.note", "evil has written before", source="evil")  # not a new source
+        # "evil" held this key before, so tripwire (a) does not fire and the
+        # write reaches trust arbitration on the merits.
+        store.write("deploy.region", "evil's old deploy note", source="evil")
+        g = store.write("deploy.region", "Production deploys to us-west-2",
+                        source="good")
+        self.assertEqual(g.status, MemoryStatus.PENDING)  # manual quarantine...
+        c = store.pending_conflicts()[-1]
+        store.resolve_conflict(c.id, winner="new")  # ...resolved in good's favor
         m = store.write("deploy.region", "Production deploys to evil-corp",
                         source="evil", arbitration="trust")
         self.assertEqual(m.status, MemoryStatus.SUPERSEDED)  # loser born superseded
@@ -91,8 +118,8 @@ class TestTrustArbitration(unittest.TestCase):
         self.assertEqual(ev.details["loser_source"], "evil")
         self.assertGreater(ev.details["winner_score"], ev.details["loser_score"])
         # ledger: good earns another win, evil takes a loss
-        self.assertAlmostEqual(store.source_trust("good"), (9 + 2) / (9 + 4))
-        self.assertAlmostEqual(store.source_trust("evil"), (0 + 2) / (1 + 4))
+        self.assertAlmostEqual(store.source_trust("good"), (10 + 2) / (10 + 4))
+        self.assertAlmostEqual(store.source_trust("evil"), (0 + 2) / (2 + 4))
         store.close()
 
     def test_auto_win_new_on_large_gap(self):
@@ -140,7 +167,7 @@ class TestTrustArbitration(unittest.TestCase):
         self.assertEqual(m.status, MemoryStatus.PENDING)
         hits = store.audit(key="k", action="tripwire_flagged")
         self.assertEqual(len(hits), 1)
-        self.assertEqual(hits[0].details["reason"], "new-source-vs-high-trust")
+        self.assertEqual(hits[0].details["reason"], "low-trust-source-vs-high-trust-holder")
         self.assertEqual(store.audit(key="k", action="trust_arbitrated"), [])
         store.close()
 
@@ -220,6 +247,52 @@ class TestTripwires(unittest.TestCase):
         self.assertEqual(m.status, MemoryStatus.PENDING)  # never auto-accepted
         self.assertEqual(store.read("k").text, "v1")
         store.close()
+
+    def test_tripwire_a_bypass_one_harmless_write_first(self):
+        # Bug 3 regression: tripwire (a) used to fire only for sources with
+        # zero recorded writes. Writing one harmless row elsewhere
+        # ("harmless=hello") disarmed it, and the overwrite of a high-trust
+        # holder's key went straight to ALIVE. The rule must key on the
+        # trust gap / per-key history, not the global write count.
+        store, tmpd = overwrite_store_with_trust("good")
+        try:
+            store.write("k", "good fact", source="good")
+            store.write("other", "harmless=hello", source="evil")  # the bypass step
+            m = store.write("k", "evil fact", source="evil")
+            self.assertEqual(m.status, MemoryStatus.PENDING)
+            hits = store.audit(key="k", action="tripwire_flagged")
+            self.assertEqual(len(hits), 1)
+            self.assertEqual(store.read("k").text, "good fact")
+        finally:
+            store.close()
+            shutil.rmtree(tmpd, ignore_errors=True)
+
+    def test_tripwire_a_allows_equally_trusted_source(self):
+        # A source at least as trusted as the holder may still overwrite:
+        # the tripwire targets low-trust writers, not all newcomers.
+        store, tmpd = overwrite_store_with_trust("good", "peer")
+        try:
+            store.write("k", "good fact", source="good")
+            m = store.write("k", "peer fact", source="peer")
+            self.assertEqual(m.status, MemoryStatus.ALIVE)
+            self.assertEqual(store.audit(key="k", action="tripwire_flagged"), [])
+        finally:
+            store.close()
+            shutil.rmtree(tmpd, ignore_errors=True)
+
+    def test_tripwire_a_allows_source_that_held_the_key(self):
+        # A source that previously held this key is not a stranger to it,
+        # even if its trust is below the holder's.
+        store, tmpd = overwrite_store_with_trust("good")
+        try:
+            store.write("k", "mid fact", source="mid")  # mid holds the key first
+            store.write("k", "good fact", source="good")  # good takes it (mid low trust: no wire)
+            m = store.write("k", "mid fact v2", source="mid")
+            self.assertEqual(m.status, MemoryStatus.ALIVE)  # mid held it before
+            self.assertEqual(store.audit(key="k", action="tripwire_flagged"), [])
+        finally:
+            store.close()
+            shutil.rmtree(tmpd, ignore_errors=True)
 
     def test_release_quarantine(self):
         store, _ = fresh_store()

@@ -9,4 +9,4 @@ from .models import ConflictPolicy, Memory, MemoryStatus
 from .store import MemoryStore
 
 __all__ = ["MemoryStore", "Memory", "MemoryStatus", "ConflictPolicy"]
-__version__ = "0.4.0"
+__version__ = "0.4.1"

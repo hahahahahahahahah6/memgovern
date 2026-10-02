@@ -93,7 +93,7 @@ and the reason is audit-logged.
 
 | Tripwire | Fires when |
 |---|---|
-| `new-source-vs-high-trust` | a source with zero recorded writes contradicts a key held by a source with trust ≥ 0.75 |
+| `low-trust-source-vs-high-trust-holder` | a source that never held the key and whose trust is below the holder's contradicts a key held by a source with trust ≥ 0.75. Keyed on the trust gap and per-key history — one harmless write elsewhere no longer disarms it |
 | `burst` | one source writes more than 20 times in 60 s (all configurable) |
 | `injection-marker:<phrase>` | the text contains a known injection phrase — `ignore previous instructions`, `disregard previous instructions`, `system:`, `override your instructions`, `do anything now`, `developer mode`, `jailbreak` |
 
@@ -109,7 +109,8 @@ a tripwire hit is a pause for review, not a deletion.
 Memory-implantation attacks succeed ~98% of the time in published tests because nothing
 in the write path asks *who* is writing. memgovern can't read minds — poisoning defense
 here is structural, not semantic — but it can keep score: sources that repeatedly win
-fair arbitrations earn weight, and first-sight overwrites by strangers get quarantined
+fair arbitrations earn weight, and overwrites of high-trust keys by lower-trust
+strangers get quarantined for review.
 instead of applied.
 
 **Expiry.** `ttl=` sets a hard deadline. Expired memories are filtered from reads;
@@ -176,7 +177,7 @@ how to die, and can prove why.
 
 ## MCP server
 
-`memgovern-mcp` exposes the governed memory as six MCP tools over stdio, so
+`memgovern-mcp` exposes the governed memory as MCP tools over stdio, so
 Claude Code / Cursor agents can use it directly. Every call goes through
 `MemoryStore` unchanged — tripwires, conflict policy and trust arbitration
 apply exactly as the library defines them. The server is a thin wrapper; all
@@ -187,9 +188,21 @@ pip install memgovern
 memgovern-mcp --print-config   # paste the JSON into your MCP client settings
 ```
 
-Tools: `memory_write` (key, text, source, optional ttl_seconds and
-arbitration), `memory_read`, `memory_delete` (tombstone), `memory_trust_report`,
-`memory_pending_conflicts`, `memory_release` (accept/reject a quarantined write).
+Tools: `memory_write` (key, text, optional ttl_seconds and arbitration),
+`memory_reserve` (compare-and-swap token), `memory_read`, `memory_delete`
+(tombstone), `memory_trust_report`, `memory_pending_conflicts`.
+
+Two security properties are fixed at startup, not per tool call:
+
+- `--source NAME` (default `agent`) labels every write the server makes.
+  A per-call `source` parameter is accepted but ignored — a poisoned agent
+  must not be able to claim `source="user"` for its own writes, or the
+  trust ledger and tripwires become fiction.
+- `memory_release` is **not** exposed by default. Quarantine review is a
+  human step: run `memgovern-review list` / `accept <id>` / `reject <id>`
+  from a shell (same DB: `$MEMGOVERN_DB` or
+  `~/.local/share/memgovern/memory.db`). Pass `--expose-release` only if
+  you deliberately want the agent to review its own quarantines.
 
 The server defaults to the MANUAL conflict policy: a contradicting write is
 quarantined as PENDING for review instead of silently overwriting. Default DB
@@ -198,8 +211,7 @@ opened per tool call so other processes can share the file.
 
 Honest limits: stdio only (no SSE/HTTP). Your MCP client spawns the server as
 a subprocess, so the client and any direct library use must point at the same
-DB file. `memory_release` reviews quarantines the library created — it adds no
-new arbitration logic.
+DB file.
 
 ## Limitations (read before adopting)
 
@@ -209,7 +221,9 @@ new arbitration logic.
 - **Naive ranking.** `query()` ranks by decay score plus token overlap — fine for
   hundreds of memories, not a replacement for vector search at scale.
 - **Single node.** One SQLite file, one process. No replication. Cross-session
-  lost updates are handled by advisory write reservations (v0.4), not locks.
+  lost updates are handled by write reservations (v0.4): concurrent CAS writers
+  are serialized in a single transaction (v0.4.1), so exactly one wins — but a
+  process writing the SQLite file directly still bypasses them.
 - **Poisoning defense is structural, not semantic.** v0.2 adds source-trust scoring
   and tripwires, but a patient attacker can *farm* trust: write benign memories for a
   while, win a few fair arbitrations, then poison. The scores are heuristics, not proof
@@ -217,8 +231,9 @@ new arbitration logic.
   and audit trails still make bad writes visible and reversible; the marker list catches
   known injection phrases and will miss paraphrases.
 - **Trust is per-source, not per-agent.** A source label is only as honest as whatever
-  sets it. If the attacker controls the `source` string on their writes, the ledger
-  measures the attacker's patience, not their reliability.
+  sets it. The MCP server pins the label at startup (`--source`) and ignores per-call
+  values, so an agent can't self-label as `source="user"`; direct library users must
+  set honest labels themselves.
 - **Reservations are advisory, not locks.** They are enforced only through this API —
   a process writing the SQLite file directly bypasses them. Expiry is wall-clock,
   so a sleeping VM can surprise you. This is optimistic concurrency for cooperating
@@ -234,6 +249,31 @@ new arbitration logic.
 Roadmap exhausted for now. The remaining item (LLM-judged arbitration) needs an LLM,
 which would break the zero-dependency contract — it stays an idea until that tradeoff
 is worth it.
+
+## Changelog
+
+- **v0.4.1** — Security patch. Fixes four verified bugs: (1) CAS race — concurrent
+  `write(reservation=...)` calls are now serialized in a single `BEGIN IMMEDIATE`
+  transaction (check re-run under the lock), so exactly one writer wins;
+  (2) MCP hardening — the server pins the write source at startup (`--source`,
+  per-call values ignored) and no longer exposes `memory_release` by default
+  (opt-in `--expose-release`); quarantine review moves to the human
+  `memgovern-review` CLI (`list` / `accept <id>` / `reject <id>`);
+  (3) tripwire (a) reworked — it now fires on the trust gap between a
+  lower-trust writer that never held the key and a high-trust holder, instead
+  of the global write count (one harmless write elsewhere no longer disarms it);
+  (4) stale `build/` and `*.egg-info/` artifacts removed from the repo.
+- **v0.4** — Multi-session write reservations (compare-and-swap): `reserve()` binds
+  a token to a key's live version; `write(reservation=...)` applies only if the
+  version is unchanged, otherwise returns an unsaved `conflict` with the current
+  value attached. New `memory_reserve` MCP tool.
+- **v0.3** — Stdlib-only MCP server (`memgovern-mcp`): governed memory as
+  JSON-RPC 2.0 tools over stdio, MANUAL policy by default.
+- **v0.2** — Source trust scores (Bayesian-smoothed conflict win rate, 30-day
+  half-life decay toward the prior) and three poisoning tripwires
+  (new-source-vs-high-trust, burst, injection markers).
+- **v0.1** — Initial release: decay, tombstones, conflict arbitration, expiry,
+  audit trail. Zero dependencies, SQLite under the hood.
 
 ## License
 

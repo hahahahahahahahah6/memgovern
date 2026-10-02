@@ -7,8 +7,11 @@ Run: python3 tests/test_reservations.py  (or: python3 -m unittest discover -s te
 """
 
 import json
+import multiprocessing as mp
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -159,6 +162,73 @@ class ReservationTests(unittest.TestCase):
         before = store.source_trust("a")
         store.write("k", "stale", source="a", reservation=t)
         self.assertEqual(store.source_trust("a"), before)
+
+
+def _cas_race_worker(db_path, key, text, barrier, out_queue):
+    """One racer: reserve, wait for all racers to hold a token, then write."""
+    from memgovern import MemoryStore
+    store = MemoryStore(db_path)
+    try:
+        token = store.reserve(key, source="racer")
+        barrier.wait(timeout=30)
+        mem = store.write(key, text, source="racer", reservation=token)
+        out_queue.put(mem.status)
+    except Exception as e:  # noqa: BLE001 -- report failures as statuses
+        out_queue.put(f"ERROR: {e!r}")
+    finally:
+        store.close()
+
+
+class ConcurrentCasTests(unittest.TestCase):
+    """Bug 1 regression: _cas_check read the version and wrote later with no
+    lock, so N concurrent processes could all pass the check and all go
+    ALIVE. Exactly one writer may win per round."""
+
+    ROUNDS = 5
+    RACERS = 4
+
+    def test_concurrent_cas_writes_exactly_one_winner(self):
+        tmpd = tempfile.mkdtemp(prefix="memgovern-cas-race-")
+        db = os.path.join(tmpd, "race.db")
+        try:
+            seed = MemoryStore(db)
+            seed.write("k", "v0", source="seed")
+            seed.close()
+            ctx = mp.get_context("fork")
+            for r in range(self.ROUNDS):
+                barrier = ctx.Barrier(self.RACERS)
+                out_queue = ctx.Queue()
+                procs = [
+                    ctx.Process(target=_cas_race_worker,
+                                args=(db, "k", f"racer-{i}-round-{r}",
+                                      barrier, out_queue))
+                    for i in range(self.RACERS)
+                ]
+                for p in procs:
+                    p.start()
+                for p in procs:
+                    p.join(60)
+                self.assertTrue(all(p.exitcode == 0 for p in procs),
+                                f"round {r}: worker crashed")
+                statuses = [out_queue.get(timeout=10)
+                            for _ in range(self.RACERS)]
+                winners = [s for s in statuses
+                           if s == MemoryStatus.ALIVE]
+                self.assertEqual(len(winners), 1,
+                                 f"round {r}: expected exactly 1 winner, "
+                                 f"got statuses={statuses}")
+                # And the key really has a single live row afterwards.
+                check = MemoryStore(db)
+                try:
+                    n = check._db.execute(
+                        "SELECT COUNT(*) c FROM memories WHERE key=? AND status=?",
+                        ("k", MemoryStatus.ALIVE)).fetchone()["c"]
+                finally:
+                    check.close()
+                self.assertEqual(n, 1,
+                                 f"round {r}: {n} alive rows for one key")
+        finally:
+            shutil.rmtree(tmpd, ignore_errors=True)
 
 
 class McpReservationTests(unittest.TestCase):

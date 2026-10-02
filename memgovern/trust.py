@@ -21,8 +21,10 @@ Fixed, documented rules checked on every write. A tripwire never
 auto-accepts: the write is born ``pending`` (quarantined) and the hit is
 audit-logged with its reason.
 
-1. ``new-source-vs-high-trust`` -- a source with zero recorded writes
-   contradicting a key held by a high-trust source (trust >= floor).
+1. ``low-trust-source-vs-high-trust-holder`` -- a source that never held
+   the key and whose trust is below the holder's, contradicting a key
+   held by a high-trust source (trust >= floor). Keyed on the trust gap
+   and per-key history, not on the source's global write count.
 2. ``burst`` -- more than N writes from one source inside M seconds
    (defaults: 20 writes / 60 s).
 3. ``injection-marker:<phrase>`` -- the text contains a known
@@ -43,8 +45,8 @@ TRUST_K_DEFAULT = 4
 TRUST_HALF_LIFE_DEFAULT = 30 * 86400
 # Auto-arbitration needs a trust gap strictly greater than this.
 TRUST_THRESHOLD_DEFAULT = 0.25
-# Tripwire (a): a holder at or above this trust makes first-sight overwrites
-# by brand-new sources quarantine instead of applying.
+# Tripwire (a): a holder at or above this trust makes overwrites by
+# lower-trust sources that never held the key quarantine instead of applying.
 HIGH_TRUST_FLOOR_DEFAULT = 0.75
 # Tripwire (b): more than this many writes from one source inside the window.
 BURST_LIMIT_DEFAULT = 20

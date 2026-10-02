@@ -163,6 +163,14 @@ class MemoryStore:
         self._db = sqlite3.connect(path)
         self._db.row_factory = sqlite3.Row
         self._db.executescript(_SCHEMA)
+        # True while a CAS-gated write holds the write lock: intermediate
+        # commits are deferred until the whole check+write commits at once.
+        self._cas_txn = False
+
+    def _maybe_commit(self):
+        """Commit unless inside a CAS transaction (deferred to the end)."""
+        if not self._cas_txn:
+            self._db.commit()
 
     # ------------------------------------------------------------------ helpers
 
@@ -196,7 +204,7 @@ class MemoryStore:
             "INSERT INTO audit (ts, actor, action, key, memory_id, details) VALUES (?,?,?,?,?,?)",
             (self._now(), self.actor, action, key, memory_id, json.dumps(details)),
         )
-        self._db.commit()
+        self._maybe_commit()
 
     @staticmethod
     def _clamp_importance(v: float) -> float:
@@ -240,14 +248,69 @@ class MemoryStore:
             raise ValueError("arbitration must be 'manual' or 'trust'")
         now = self._now()
 
-        # CAS gate, first: a stale token fails before anything is counted.
-        # The token is consumed (released) only on success.
-        cas_expected = None
-        if reservation is not None:
-            ok, cas_expected, reason = self._cas_check(key, reservation, now)
-            if not ok:
-                return self._cas_conflict_memory(key, text, source, now, reason)
+        if reservation is None:
+            return self._write_impl(
+                key, text, now, ttl=ttl, source=source, importance=importance,
+                half_life=half_life, tags=tags, polarity=polarity,
+                also_check_similar=also_check_similar, arbitration=arbitration,
+                reservation=None, cas_expected=None,
+            )
 
+        # CAS path. The pre-check fails fast on stale tokens, but the check
+        # that matters happens under the write lock: BEGIN IMMEDIATE
+        # serializes concurrent CAS writers, the check is re-run inside the
+        # transaction, and every intermediate commit is deferred until the
+        # single commit at the end. Exactly one concurrent writer can win.
+        ok, _, reason = self._cas_check(key, reservation, now)
+        if not ok:
+            self._maybe_commit()  # flush any token cleanup from the check
+            return self._cas_conflict_memory(key, text, source, now, reason)
+        self._db.execute("BEGIN IMMEDIATE")
+        self._cas_txn = True
+        try:
+            ok, cas_expected, reason = self._cas_check(key, reservation, now)
+            if ok:
+                mem = self._write_impl(
+                    key, text, now, ttl=ttl, source=source, importance=importance,
+                    half_life=half_life, tags=tags, polarity=polarity,
+                    also_check_similar=also_check_similar, arbitration=arbitration,
+                    reservation=reservation, cas_expected=cas_expected,
+                )
+                self._db.commit()
+                return mem
+            self._db.rollback()
+        except Exception:
+            self._db.rollback()
+            raise
+        finally:
+            self._cas_txn = False
+        self._maybe_commit()  # flush any token cleanup from the re-check
+        return self._cas_conflict_memory(key, text, source, now, reason)
+
+    def _write_impl(
+        self,
+        key: str,
+        text: str,
+        now: float,
+        *,
+        ttl: Optional[float],
+        source: str,
+        importance: float,
+        half_life: Optional[float],
+        tags: Optional[List[str]],
+        polarity: str,
+        also_check_similar: bool,
+        arbitration: Optional[str],
+        reservation: Optional[str],
+        cas_expected: Optional[int],
+    ) -> Memory:
+        """The body of write(), after the CAS gate.
+
+        When called with a reservation, this runs inside a single
+        transaction holding the write lock (see write()); intermediate
+        commits are deferred via _maybe_commit()."""
+        # A stale token fails before anything is counted. The token is
+        # consumed (released) only on success.
         importance = self._clamp_importance(importance)
         expires_at = now + ttl if ttl else None
 
@@ -264,11 +327,13 @@ class MemoryStore:
         rivals = [m for m in rivals if not m.expired(now)]
         contradiction = bool(rivals and any(r.text != text for r in rivals))
 
-        # Tripwire (a): a brand-new source overwriting a high-trust holder's
-        # key on first sight. Checked before the source ledger is touched.
-        if contradiction and not trip_reason and self._is_new_source(source):
-            if any(self.source_trust(r.source) >= self.high_trust_floor for r in rivals):
-                trip_reason = "new-source-vs-high-trust"
+        # Tripwire (a): a lower-trust source that never held this key
+        # overwriting a high-trust holder's key. Keyed on the trust gap and
+        # per-key history -- not on the source's global write count, which a
+        # single harmless write elsewhere used to defeat. Checked before the
+        # source ledger is touched.
+        if contradiction and not trip_reason:
+            trip_reason = self._check_holder_tripwire(key, source, rivals)
 
         # Ledger: every write counts, quarantined or not.
         self._log_write(source, now)
@@ -315,7 +380,7 @@ class MemoryStore:
              half_life, json.dumps(tags or []), polarity, conflict_id, version),
         )
         mem_id = cur.lastrowid
-        self._db.commit()
+        self._maybe_commit()
 
         if trust_details is not None:
             self._finalize_trust_arbitration(conflict_id, mem_id, key, trust_details, now)
@@ -335,7 +400,7 @@ class MemoryStore:
         if reservation is not None:
             # CAS succeeded: consume the token so it can't be replayed.
             self._db.execute("DELETE FROM reservations WHERE token=?", (reservation,))
-            self._db.commit()
+            self._maybe_commit()
             self._audit("cas_applied", key, mem_id, {
                 "token_prefix": reservation[:8],
                 "expected_version": cas_expected, "applied_version": version,
@@ -378,12 +443,37 @@ class MemoryStore:
             "DELETE FROM write_log WHERE ts <= ?", (now - self.burst_window,))
         self._db.execute(
             "INSERT INTO write_log (source, ts) VALUES (?,?)", (source, now))
-        self._db.commit()
+        self._maybe_commit()
 
-    def _is_new_source(self, source: str) -> bool:
+    def _check_holder_tripwire(self, key: str, source: str,
+                               rivals: List[Memory]) -> Optional[str]:
+        """Tripwire (a): quarantine when a source that never held `key`
+        contradicts a high-trust holder's live value.
+
+        Fires only when the most-trusted holder scores at or above
+        high_trust_floor and the writer's trust is strictly below the
+        holder's. An equally-or-more-trusted source, or one that held the
+        key before, follows the normal conflict policy instead."""
+        holder = max(rivals, key=lambda m: self.source_trust(m.source))
+        holder_trust = self.source_trust(holder.source)
+        if holder_trust < self.high_trust_floor:
+            return None
+        if self.source_trust(source) >= holder_trust:
+            return None
+        if self._source_ever_held_key(source, key):
+            return None
+        return "low-trust-source-vs-high-trust-holder"
+
+    def _source_ever_held_key(self, source: str, key: str) -> bool:
+        """Has `source` ever had an applied (non-quarantined) write on `key`?
+
+        Quarantined (PENDING) writes never took effect, so they don't count:
+        retrying a quarantined overwrite must not get easier."""
         row = self._db.execute(
-            "SELECT writes FROM source_stats WHERE source=?", (source,)).fetchone()
-        return row is None or row["writes"] == 0
+            "SELECT 1 FROM memories WHERE source=? AND key=? AND status != ? LIMIT 1",
+            (source, key, MemoryStatus.PENDING),
+        ).fetchone()
+        return row is not None
 
     def _ensure_source_row(self, source: str, now: float):
         self._db.execute(
@@ -400,7 +490,7 @@ class MemoryStore:
             " last_update=? WHERE source=?",
             (1 if quarantined else 0, now, source),
         )
-        self._db.commit()
+        self._maybe_commit()
 
     def _record_win(self, source: str, now: float):
         self._ensure_source_row(source, now)
@@ -409,7 +499,7 @@ class MemoryStore:
             " WHERE source=?",
             (now, source),
         )
-        self._db.commit()
+        self._maybe_commit()
 
     def _record_loss(self, source: str, now: float):
         self._ensure_source_row(source, now)
@@ -418,7 +508,7 @@ class MemoryStore:
             " WHERE source=?",
             (now, source),
         )
-        self._db.commit()
+        self._maybe_commit()
 
     def source_trust(self, source: str) -> float:
         """Current trust score for a source: Bayesian-smoothed conflict win
@@ -498,7 +588,7 @@ class MemoryStore:
             status = MemoryStatus.SUPERSEDED  # the losing write is born superseded
             winner_source, loser_source = rivals[0].source, new_source
             winner_id, resolution = rivals[0].id, "trust-old-wins"
-        self._db.commit()
+        self._maybe_commit()
         return conflict_id, status, {
             "winner": winner, "resolution": resolution, "winner_id": winner_id,
             "winner_source": winner_source, "loser_source": loser_source,
@@ -518,7 +608,7 @@ class MemoryStore:
         )
         self._record_win(details["winner_source"], now)
         self._record_loss(details["loser_source"], now)
-        self._db.commit()
+        self._maybe_commit()
         self._audit("trust_arbitrated", key, mem_id, {
             "conflict_id": conflict_id,
             "resolution": details["resolution"],
@@ -548,17 +638,80 @@ class MemoryStore:
             "UPDATE memories SET status=?, updated_at=? WHERE id=?",
             (MemoryStatus.ALIVE, now, memory_id),
         )
-        self._db.commit()
+        self._maybe_commit()
         self._audit("quarantine_released", mem.key, memory_id,
                     {"note": "tripwire quarantine reviewed and released"})
         return self._get(memory_id)
+
+    def review_quarantine(self, memory_id: int, decision: str,
+                          reviewer: str = "human") -> str:
+        """Human review of a quarantined write. decision: "accept" | "reject".
+
+        Unifies the two quarantine shapes: a tripwire quarantine (PENDING,
+        no conflict row) is applied or tombstoned; a conflict quarantine is
+        resolved in the new or old version's favor. Returns the memory's new
+        status. Raises KeyError/ValueError on bad ids, non-quarantined
+        memories, or bad decisions. This is the human review step -- it is
+        deliberately NOT exposed to the agent via MCP by default.
+        """
+        if decision not in ("accept", "reject"):
+            raise ValueError("decision must be 'accept' or 'reject'")
+        mem = self._get_by_id(memory_id)
+        if mem is None:
+            raise KeyError(f"no memory #{memory_id}")
+        if mem.status != MemoryStatus.PENDING:
+            raise ValueError(
+                f"memory #{memory_id} is not quarantined (status={mem.status})")
+        if mem.conflict_id is None:
+            if decision == "accept":
+                return self.release_quarantine(memory_id).status
+            return self._reject_tripwire_quarantine(mem, reviewer)
+        conflict = self.resolve_conflict(
+            mem.conflict_id, winner="new" if decision == "accept" else "old")
+        return (MemoryStatus.ALIVE if conflict.winner_id == memory_id
+                else MemoryStatus.SUPERSEDED)
+
+    def _reject_tripwire_quarantine(self, mem: Memory, reviewer: str) -> str:
+        """Discard a tripwire-quarantined write: tombstone it (reviewed,
+        never applied)."""
+        now = self._now()
+        self._db.execute(
+            "UPDATE memories SET status=?, updated_at=?, deleted_reason=? WHERE id=?",
+            (MemoryStatus.TOMBSTONED, now,
+             f"tripwire quarantine rejected by {reviewer}", mem.id),
+        )
+        self._maybe_commit()
+        self._audit("tripwire_rejected", mem.key, mem.id,
+                     {"reviewed_by": reviewer,
+                      "note": "quarantined write reviewed and discarded; never applied"})
+        return MemoryStatus.TOMBSTONED
+
+    def quarantine_reason(self, memory_id: int) -> Optional[str]:
+        """Best-effort human reason why a PENDING memory is quarantined."""
+        mem = self._get_by_id(memory_id)
+        if mem is None or mem.status != MemoryStatus.PENDING:
+            return None
+        if mem.conflict_id is not None:
+            # Was it a tripwire, or a plain contradiction quarantine?
+            for ev in self.audit(action="tripwire_flagged", limit=50):
+                details = ev.details if isinstance(ev.details, dict) else {}
+                if details.get("conflict_id") == mem.conflict_id:
+                    return "tripwire: " + str(details.get("reason", "unknown"))
+            conflict = self.get_conflict(mem.conflict_id)
+            policy = conflict.policy if conflict else "manual"
+            return f"contradiction quarantined under {policy} policy"
+        for ev in self.audit(action="tripwire_flagged", limit=50):
+            if ev.memory_id == mem.id:
+                details = ev.details if isinstance(ev.details, dict) else {}
+                return "tripwire: " + str(details.get("reason", "unknown"))
+        return "quarantined (reason not found in audit log)"
 
     # ------------------------------------------------- reservations (CAS)
 
     def _prune_reservations(self, now: float):
         """Lazily drop expired reservations. No audit: expiry is routine."""
         self._db.execute("DELETE FROM reservations WHERE expires_at <= ?", (now,))
-        self._db.commit()
+        self._maybe_commit()
 
     def _key_version(self, key: str, now: float) -> int:
         """The version a fresh read() would see for `key`: highest version
@@ -591,7 +744,7 @@ class MemoryStore:
                VALUES (?,?,?,?,?,?)""",
             (token, key, source, expected, now, now + ttl_seconds),
         )
-        self._db.commit()
+        self._maybe_commit()
         self._audit("reservation_issued", key, None, {
             "token_prefix": token[:8], "source": source,
             "expected_version": expected, "ttl_seconds": ttl_seconds,
@@ -604,7 +757,7 @@ class MemoryStore:
         now = self._now()
         self._prune_reservations(now)
         cur = self._db.execute("DELETE FROM reservations WHERE token=?", (token,))
-        self._db.commit()
+        self._maybe_commit()
         if cur.rowcount:
             self._audit("reservation_released", None, None,
                         {"token_prefix": token[:8]})
@@ -623,7 +776,7 @@ class MemoryStore:
             return False, None, "unknown-or-released-token"
         if row["expires_at"] <= now:
             self._db.execute("DELETE FROM reservations WHERE token=?", (token,))
-            self._db.commit()
+            self._maybe_commit()
             return False, None, "reservation-expired"
         if row["key"] != key:
             return False, None, "token-bound-to-another-key"
@@ -718,7 +871,7 @@ class MemoryStore:
             self._audit("conflict_flagged", key, None, {
                 "conflict_id": conflict_id, "resolution": "kept-both",
             })
-        self._db.commit()
+        self._maybe_commit()
         return conflict_id
 
     def resolve_conflict(self, conflict_id: int, winner: str = "new") -> Conflict:
@@ -753,7 +906,7 @@ class MemoryStore:
             "UPDATE conflicts SET resolution=?, winner_id=?, resolved_at=?, new_id=? WHERE id=?",
             (f"manual-{winner}-wins", win.id, now, new.id, conflict_id),
         )
-        self._db.commit()
+        self._maybe_commit()
         # Source-trust ledger: the winner's source earns a win, the loser's a loss.
         self._record_win(win.source, now)
         if lose:
@@ -878,7 +1031,7 @@ class MemoryStore:
                 (now, mem.source),
             )
             self._audit("tombstone", key, mem.id, {"reason": reason, "version": mem.version})
-        self._db.commit()
+        self._maybe_commit()
         return len(live)
 
     def restore(self, key: str) -> Optional[Memory]:
@@ -894,7 +1047,7 @@ class MemoryStore:
             "UPDATE memories SET status=?, updated_at=?, deleted_reason=NULL WHERE id=?",
             (MemoryStatus.ALIVE, now, row["id"]),
         )
-        self._db.commit()
+        self._maybe_commit()
         self._audit("restore", key, row["id"], {"note": "tombstone undone"})
         return self._get(row["id"])
 
@@ -960,7 +1113,7 @@ class MemoryStore:
             (MemoryStatus.TOMBSTONED, MemoryStatus.SUPERSEDED, cutoff),
         )
         n = cur.rowcount
-        self._db.commit()
+        self._maybe_commit()
         self._audit("purge", None, None, {"hard_deleted": n})
         return n
 

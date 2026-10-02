@@ -14,9 +14,22 @@ overridden by ``MEMGOVERN_DB``.
 The server defaults to the MANUAL conflict policy: a contradicting write
 is quarantined as PENDING for review instead of silently overwriting. That
 is what makes ``arbitration="trust"`` meaningful and gives the
-``memory_pending_conflicts`` / ``memory_release`` review loop something to
-review. (The library default is OVERWRITE; the server chooses the safer
-default for an agent-facing tool and says so.)
+``memory_pending_conflicts`` review loop something to review. (The library
+default is OVERWRITE; the server chooses the safer default for an agent-facing
+tool and says so.)
+
+Security model
+--------------
+Two properties are enforced at startup, not per tool call:
+
+* ``--source NAME`` (default ``agent``) fixes the source label for every
+  write the server makes. Tool-call ``source`` params are ignored: a
+  poisoned agent must not be able to claim ``source="user"`` for its own
+  writes, or the trust ledger and tripwires become fiction.
+* ``memory_release`` is NOT exposed unless ``--expose-release`` is passed.
+  Quarantine review is a human step -- run ``memgovern-review`` from a
+  shell. An agent that can release its own quarantines is the prisoner
+  judging their own case.
 
 Protocol notes: ``initialize`` -> ``notifications/initialized`` ->
 ``tools/list`` -> ``tools/call``. Malformed input gets a JSON-RPC error
@@ -58,9 +71,61 @@ def _log(msg: str) -> None:
     sys.stderr.flush()
 
 
+# ------------------------------------------------------------------ server config
+
+# Who the server claims writes are from. Fixed at startup via --source;
+# tool-call "source" params are ignored, so a poisoned agent cannot label
+# its own writes source="user" and walk past the trust ledger.
+SERVER_SOURCE = "agent"
+# memory_release is hidden unless --expose-release is passed. Review is a
+# human step (memgovern-review CLI), not an agent tool.
+EXPOSE_RELEASE = False
+
+
+def _configure(source=None, expose_release=None):
+    """Set (or reset) the server config. Called by main(); tests call it
+    directly. No arguments resets to the secure defaults."""
+    global SERVER_SOURCE, EXPOSE_RELEASE
+    SERVER_SOURCE = "agent" if source is None else source
+    EXPOSE_RELEASE = False if expose_release is None else bool(expose_release)
+
+
+def _parse_args(argv):
+    """Parse memgovern-mcp argv (without the program name).
+
+    Returns (source, expose_release, action) where action is one of
+    "serve", "print-config", "help". Raises ValueError on bad input."""
+    source = "agent"
+    expose_release = False
+    action = "serve"
+    argv = list(argv)
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--source":
+            i += 1
+            if i >= len(argv) or argv[i].startswith("-"):
+                raise ValueError("--source needs a value")
+            source = argv[i]
+        elif a.startswith("--source="):
+            source = a.split("=", 1)[1]
+        elif a == "--expose-release":
+            expose_release = True
+        elif a == "--print-config":
+            action = "print-config"
+        elif a in ("-h", "--help"):
+            action = "help"
+        else:
+            raise ValueError(f"unknown argument: {a}")
+        i += 1
+    if not source:
+        raise ValueError("--source needs a non-empty value")
+    return source, expose_release, action
+
+
 # ------------------------------------------------------------------ tool defs
 
-TOOLS = [
+_BASE_TOOLS = [
     {
         "name": "memory_write",
         "description": (
@@ -72,6 +137,8 @@ TOOLS = [
             "compare-and-swap: the write applies only if the key is unchanged "
             "since the reservation, otherwise it returns status 'conflict' "
             "with the current value. "
+            "The write's source label is fixed at server startup (--source); "
+            "any per-call source is ignored. "
             "SQLite backend. Structural defense, no LLM, no network."
         ),
         "inputSchema": {
@@ -79,8 +146,6 @@ TOOLS = [
             "properties": {
                 "key": {"type": "string", "description": "memory key, e.g. 'user/name'"},
                 "text": {"type": "string", "description": "the memory content"},
-                "source": {"type": "string", "description": "who is writing; feeds the trust ledger",
-                           "default": "agent"},
                 "ttl_seconds": {"type": "number", "description": "optional expiry in seconds"},
                 "arbitration": {"type": "string", "enum": ["manual", "trust"],
                                 "description": "manual (default): quarantine contradictions; "
@@ -101,15 +166,14 @@ TOOLS = [
             "it to memory_write as reservation: the write applies only if no "
             "other session changed the key meanwhile. Prevents last-writer-"
             "wins across concurrent agent sessions. Advisory: only enforced "
-            "through this API, not against raw SQLite writes."
+            "through this API, not against raw SQLite writes. "
+            "The reservation's source label is fixed at server startup "
+            "(--source); any per-call source is ignored."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "key": {"type": "string", "description": "memory key to reserve"},
-                "source": {"type": "string",
-                           "description": "who is reserving (audit label)",
-                           "default": "agent"},
                 "ttl_seconds": {"type": "number",
                                 "description": "reservation expiry in seconds",
                                 "default": 300},
@@ -160,34 +224,54 @@ TOOLS = [
         "description": (
             "Everything waiting for review: quarantined contradicting writes "
             "(with both sides' text) and tripwire-quarantined writes (with "
-            "the tripwire reason). Pair with memory_release."
+            "the tripwire reason). Review them with the memgovern-review CLI "
+            "(human step); memory_release is only listed when the server was "
+            "started with --expose-release."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
-    {
-        "name": "memory_release",
-        "description": (
-            "Review a quarantined write. accept: apply it (tripwire "
-            "quarantine) or resolve its conflict in its favor. reject: "
-            "discard it (tripwire quarantine is tombstoned; a conflict is "
-            "resolved in the old version's favor)."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "quarantine_id": {"type": "integer",
-                                 "description": "memory id of the quarantined write"},
-                "decision": {"type": "string", "enum": ["accept", "reject"]},
-                "source": {"type": "string",
-                           "description": "who reviewed it (audit label)",
-                           "default": "agent"},
-            },
-            "required": ["quarantine_id", "decision"],
-        },
-    },
 ]
 
-_TOOL_NAMES = {t["name"] for t in TOOLS}
+_RELEASE_TOOL = {
+    "name": "memory_release",
+    "description": (
+        "Review a quarantined write. accept: apply it (tripwire "
+        "quarantine) or resolve its conflict in its favor. reject: "
+        "discard it (tripwire quarantine is tombstoned; a conflict is "
+        "resolved in the old version's favor). "
+        "Only exposed when the server was started with --expose-release; "
+        "otherwise review via the memgovern-review CLI."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "quarantine_id": {"type": "integer",
+                             "description": "memory id of the quarantined write"},
+            "decision": {"type": "string", "enum": ["accept", "reject"]},
+            "source": {"type": "string",
+                       "description": "who reviewed it (audit label only)",
+                       "default": "agent"},
+        },
+        "required": ["quarantine_id", "decision"],
+    },
+}
+
+
+def active_tools():
+    """The tool list for this server instance. memory_release is included
+    only when --expose-release was passed at startup."""
+    tools = list(_BASE_TOOLS)
+    if EXPOSE_RELEASE:
+        tools.append(_RELEASE_TOOL)
+    return tools
+
+
+# Backwards-compatible alias: the full set, including memory_release.
+TOOLS = _BASE_TOOLS + [_RELEASE_TOOL]
+
+
+def _active_tool_names():
+    return {t["name"] for t in active_tools()}
 
 
 # ------------------------------------------------------------------ handlers
@@ -210,27 +294,6 @@ def _memory_json(mem: Memory) -> Dict[str, Any]:
     }
 
 
-def _quarantine_reason(store: MemoryStore, mem: Memory) -> Optional[str]:
-    """Best-effort human reason why a PENDING memory is quarantined."""
-    if mem.conflict_id is not None:
-        # Was it a tripwire, or a plain contradiction quarantine?
-        for ev in store.audit(action="tripwire_flagged", limit=50):
-            try:
-                details = ev.details if isinstance(ev.details, dict) else {}
-            except Exception:
-                details = {}
-            if details.get("conflict_id") == mem.conflict_id:
-                return "tripwire: " + str(details.get("reason", "unknown"))
-        conflict = store.get_conflict(mem.conflict_id)
-        policy = conflict.policy if conflict else "manual"
-        return f"contradiction quarantined under {policy} policy"
-    for ev in store.audit(action="tripwire_flagged", limit=50):
-        if ev.memory_id == mem.id:
-            details = ev.details if isinstance(ev.details, dict) else {}
-            return "tripwire: " + str(details.get("reason", "unknown"))
-    return "quarantined (reason not found in audit log)"
-
-
 def _pending_memories(store: MemoryStore) -> List[Memory]:
     rows = store._db.execute(
         "SELECT * FROM memories WHERE status=? ORDER BY id", (MemoryStatus.PENDING,)
@@ -244,9 +307,9 @@ def _tool_memory_write(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, An
     text = args["text"]
     if not isinstance(key, str) or not isinstance(text, str):
         raise ValueError("key and text must be strings")
-    kwargs: Dict[str, Any] = {
-        "source": args.get("source", "agent"),
-    }
+    # The source label is fixed at server startup (--source). A per-call
+    # "source" is ignored: a poisoned agent must not label its own writes.
+    kwargs: Dict[str, Any] = {"source": SERVER_SOURCE}
     if args.get("ttl_seconds") is not None:
         kwargs["ttl"] = float(args["ttl_seconds"])
     if args.get("arbitration") is not None:
@@ -258,7 +321,7 @@ def _tool_memory_write(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, An
     out["conflict_id"] = mem.conflict_id
     out["source_trust"] = round(store.source_trust(mem.source), 4)
     if mem.status == MemoryStatus.PENDING:
-        out["quarantine_reason"] = _quarantine_reason(store, mem)
+        out["quarantine_reason"] = store.quarantine_reason(mem.id)
     if mem.status == MemoryStatus.CONFLICT:
         # CAS lost race: nothing was applied. Attach the current live value
         # so the caller can merge and retry with a fresh reservation.
@@ -274,7 +337,7 @@ def _tool_memory_reserve(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, 
     if not isinstance(key, str):
         raise ValueError("key must be a string")
     ttl = args.get("ttl_seconds", 300)
-    token = store.reserve(key, source=args.get("source", "agent"),
+    token = store.reserve(key, source=SERVER_SOURCE,
                           ttl_seconds=float(ttl))
     current = store.read(key)
     return _ok_text({
@@ -319,7 +382,7 @@ def _tool_memory_pending_conflicts(store: MemoryStore, args: Dict[str, Any]) -> 
     tripwired_out = []
     for mem in _pending_memories(store):
         entry = _memory_json(mem)
-        entry["quarantine_reason"] = _quarantine_reason(store, mem)
+        entry["quarantine_reason"] = store.quarantine_reason(mem.id)
         if mem.conflict_id is not None:
             conflict = store.get_conflict(mem.conflict_id)
             old = store._get_by_id(conflict.old_id) if conflict and conflict.old_id else None
@@ -333,48 +396,22 @@ def _tool_memory_pending_conflicts(store: MemoryStore, args: Dict[str, Any]) -> 
 
 
 def _tool_memory_release(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, Any]:
+    # Thin wrapper over MemoryStore.review_quarantine. This tool is only
+    # reachable when the server was started with --expose-release; by
+    # default review happens via the memgovern-review CLI (human step).
     mem_id = args["quarantine_id"]
     decision = args["decision"]
     if not isinstance(mem_id, int) or isinstance(mem_id, bool):
         raise ValueError("quarantine_id must be an integer memory id")
     if decision not in ("accept", "reject"):
         raise ValueError("decision must be 'accept' or 'reject'")
-    reviewer = args.get("source", "agent")
-
-    mem = store._get_by_id(mem_id)
-    if mem is None:
-        return _tool_error(f"no memory #{mem_id}")
-    if mem.status != MemoryStatus.PENDING:
-        return _tool_error(f"memory #{mem_id} is not quarantined (status={mem.status})")
-
-    if mem.conflict_id is None:
-        # Tripwire quarantine: no conflict row.
-        if decision == "accept":
-            released = store.release_quarantine(mem_id)
-            new_status = released.status
-        else:
-            new_status = _reject_tripwire_quarantine(store, mem, reviewer)
-    else:
-        conflict = store.resolve_conflict(
-            mem.conflict_id, winner="new" if decision == "accept" else "old")
-        new_status = "alive" if conflict.winner_id == mem_id else MemoryStatus.SUPERSEDED
+    reviewer = args.get("source", "agent")  # audit label only
+    try:
+        new_status = store.review_quarantine(mem_id, decision, reviewer=reviewer)
+    except (KeyError, ValueError) as e:
+        return _tool_error(str(e))
     return _ok_text({"memory_id": mem_id, "decision": decision,
                      "new_status": new_status, "reviewed_by": reviewer})
-
-
-def _reject_tripwire_quarantine(store: MemoryStore, mem: Memory, reviewer: str) -> str:
-    """Discard a tripwire-quarantined write: tombstone it (reviewed, never applied)."""
-    now = store._now()
-    store._db.execute(
-        "UPDATE memories SET status=?, updated_at=?, deleted_reason=? WHERE id=?",
-        (MemoryStatus.TOMBSTONED, now,
-         f"tripwire quarantine rejected by {reviewer}", mem.id),
-    )
-    store._db.commit()
-    store._audit("tripwire_rejected", mem.key, mem.id,
-                 {"reviewed_by": reviewer,
-                  "note": "quarantined write reviewed and discarded; never applied"})
-    return MemoryStatus.TOMBSTONED
 
 
 _TOOL_HANDLERS = {
@@ -432,14 +469,14 @@ def handle_request(req: Any) -> Optional[Dict[str, Any]]:
 
         if method == "tools/list":
             return {"jsonrpc": "2.0", "id": req_id,
-                    "result": {"tools": TOOLS}}
+                    "result": {"tools": active_tools()}}
 
         if method == "tools/call":
             if not isinstance(params, dict):
                 return _error_response(req_id, -32602, "invalid params")
             name = params.get("name")
             args = params.get("arguments") or {}
-            if not isinstance(name, str) or name not in _TOOL_NAMES:
+            if not isinstance(name, str) or name not in _active_tool_names():
                 return _tool_error_result(req_id, f"unknown tool: {name}")
             try:
                 result = _call_tool(name, args)
@@ -486,22 +523,45 @@ def serve(stdin=None, stdout=None) -> int:
 
 
 def print_config() -> int:
-    """Print a Claude Code MCP config snippet for copy-paste into settings."""
+    """Print a Claude Code MCP config snippet for copy-paste into settings.
+
+    Pins --source so the deployed server labels writes as the agent, not
+    whatever a tool call claims."""
     sys.stdout.write(json.dumps(
-        {"mcpServers": {SERVER_NAME: {"command": "memgovern-mcp"}}}, indent=2) + "\n")
+        {"mcpServers": {SERVER_NAME: {"command": "memgovern-mcp",
+                                      "args": ["--source", "agent"]}}},
+        indent=2) + "\n")
     return 0
 
 
+_HELP = """\
+memgovern-mcp: governed agent memory as an MCP stdio server.
+Usage: memgovern-mcp [--source NAME] [--expose-release] [--print-config]
+
+  --source NAME     source label for every write the server makes
+                    (default: agent). Per-call "source" params are ignored.
+  --expose-release  also expose the memory_release tool. By default review
+                    is a human step via the memgovern-review CLI.
+  --print-config    print a Claude Code MCP config snippet and exit.
+"""
+
+
 def main(argv=None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if "--print-config" in argv:
-        return print_config()
-    if "-h" in argv or "--help" in argv:
-        sys.stdout.write(
-            "memgovern-mcp: governed agent memory as an MCP stdio server.\n"
-            "Usage: memgovern-mcp [--print-config]\n"
-        )
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # Tolerate a leading program name (main(["memgovern-mcp", "--help"])).
+    if raw and not raw[0].startswith("-"):
+        raw = raw[1:]
+    try:
+        source, expose_release, action = _parse_args(raw)
+    except ValueError as e:
+        sys.stderr.write(f"memgovern-mcp: {e}\n")
+        return 2
+    if action == "help":
+        sys.stdout.write(_HELP)
         return 0
+    _configure(source=source, expose_release=expose_release)
+    if action == "print-config":
+        return print_config()
     return serve()
 
 
